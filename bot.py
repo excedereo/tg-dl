@@ -23,11 +23,9 @@ import asyncio
 from pathlib import Path
 
 import yt_dlp
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    InlineQuery, InlineQueryResultArticle, InputTextMessageContent,
-    ChosenInlineResult, InputMediaVideo, FSInputFile,
-)
+from aiogram import Bot, Dispatcher
+from aiogram.types import InlineQuery, InlineQueryResultCachedVideo, \
+    InlineQueryResultArticle, InputTextMessageContent, FSInputFile
 
 from shared import binaries
 from shared.env import get as env
@@ -43,6 +41,9 @@ MAX_DURATION = 10 * 60          # лимит длительности, сек (�
 MAX_QUALITY = 720              # потолок качества, чтобы влезть в 50 МБ
 URL_RE = re.compile(r"https?://\S+", re.I)
 SUPPORTED = re.compile(r"(youtube\.com|youtu\.be|tiktok\.com)", re.I)
+
+# кэш url -> (file_id, title): уже скачанное отдаём мгновенно, не качаем дважды
+_cache: dict[str, tuple[str, str]] = {}
 
 # карта id_результата -> ссылка (chosen_inline_result не возвращает текст запроса)
 _pending: dict[str, str] = {}
@@ -100,6 +101,26 @@ async def run() -> None:
     bot = Bot(token)
     dp = Dispatcher()
 
+    async def get_file_id(url: str) -> tuple[str, str] | None:
+        """Возвращает (file_id, title) — из кэша или качает и заливает в склад."""
+        if url in _cache:
+            return _cache[url]
+        res = await asyncio.to_thread(_download, url)
+        if not res:
+            return None
+        f, title = res
+        try:
+            sent = await bot.send_video(storage_id, FSInputFile(f), caption=title[:200])
+            file_id = sent.video.file_id
+            _cache[url] = (file_id, title)
+            log.info("готово: %s", title[:60])
+            return file_id, title
+        except Exception as e:
+            log.error("ошибка заливки в склад: %s", str(e)[:200])
+            return None
+        finally:
+            shutil.rmtree(f.parent, ignore_errors=True)
+
     @dp.inline_query()
     async def on_inline(q: InlineQuery):
         url_m = URL_RE.search(q.query or "")
@@ -109,50 +130,26 @@ async def run() -> None:
                            switch_pm_text="Вставь ссылку YouTube или TikTok",
                            switch_pm_parameter="start")
             return
-        rid = uuid.uuid4().hex
-        _pending[rid] = url
-        result = InlineQueryResultArticle(
-            id=rid,
-            title="Скачать видео",
-            description=url[:60],
-            input_message_content=InputTextMessageContent(
-                message_text="⏳ Качаю видео..."),
+        log.info("запрос: %s", url)
+        got = await get_file_id(url)
+        if not got:
+            # не скачалось — показываем «ошибку» как выбираемый результат
+            err = InlineQueryResultArticle(
+                id=uuid.uuid4().hex, title="Не удалось скачать",
+                description="слишком длинное, недоступно или не поддерживается",
+                input_message_content=InputTextMessageContent(
+                    message_text="❌ Не удалось скачать видео"))
+            await q.answer([err], cache_time=1, is_personal=True)
+            return
+        file_id, title = got
+        # готовое видео с превью — тап моментально отправляет
+        result = InlineQueryResultCachedVideo(
+            id=uuid.uuid4().hex,
+            video_file_id=file_id,
+            title=title[:100],
+            description="Нажми, чтобы отправить",
         )
-        await q.answer([result], cache_time=1, is_personal=True)
-
-    @dp.chosen_inline_result()
-    async def on_chosen(c: ChosenInlineResult):
-        url = _pending.pop(c.result_id, None)
-        inline_id = c.inline_message_id
-        if not url or not inline_id:
-            return
-        res = await asyncio.to_thread(_download, url)
-        if not res:
-            try:
-                await bot.edit_message_text(
-                    "❌ Не удалось скачать (слишком длинное или недоступно)",
-                    inline_message_id=inline_id)
-            except Exception:
-                pass
-            return
-        f, title = res
-        try:
-            # заливаем видео в склад -> берём file_id -> подменяем заглушку
-            sent = await bot.send_video(storage_id, FSInputFile(f), caption=title[:200])
-            file_id = sent.video.file_id
-            await bot.edit_message_media(
-                InputMediaVideo(media=file_id, caption=title[:200]),
-                inline_message_id=inline_id)
-            log.info("отправлено: %s", title[:60])
-        except Exception as e:
-            log.error("ошибка отправки: %s", str(e)[:200])
-            try:
-                await bot.edit_message_text("❌ Ошибка отправки видео",
-                                            inline_message_id=inline_id)
-            except Exception:
-                pass
-        finally:
-            shutil.rmtree(f.parent, ignore_errors=True)
+        await q.answer([result], cache_time=300, is_personal=True)
 
     log.info("бот запущен (inline)")
     await dp.start_polling(bot, handle_signals=False)
